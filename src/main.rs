@@ -1,12 +1,23 @@
 use core::str::Chars;
+use std::fmt;
 use std::iter::Peekable;
 use std::{io, println, string::String};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Expr {
     Var(String),
     Lambda(String, Box<Expr>),
     App(Box<Expr>, Box<Expr>),
+}
+
+impl fmt::Display for Expr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Expr::Var(name) => write!(f, "{}", name),
+            Expr::Lambda(param, body) => write!(f, "\\{} {}", param, body),
+            Expr::App(l, r) => write!(f, "({} {})", l, r),
+        }
+    }
 }
 
 fn try_skip_whitespace(code: &mut Peekable<Chars>) {
@@ -94,6 +105,101 @@ fn parse(code: &mut Peekable<Chars>) -> Result<Expr, String> {
     }
 }
 
+struct Substituer {
+    counter: u32,
+}
+
+impl Substituer {
+    pub fn new() -> Self {
+        Self { counter: 0 }
+    }
+
+    fn fresh_name(&mut self, base: &str) -> String {
+        self.counter += 1;
+        format!("{}{}", base, self.counter)
+    }
+
+    fn is_free(var: &str, expr: &Expr) -> bool {
+        match expr {
+            Expr::Var(str) => var == str,
+            Expr::Lambda(param, body) => var != param && Self::is_free(var, body),
+            Expr::App(l, r) => Self::is_free(var, l) || Self::is_free(var, r),
+        }
+    }
+
+    pub fn substitute(&mut self, var: &str, expr: &Expr, value: &Expr) -> Expr {
+        match expr {
+            Expr::Var(name) => {
+                if name == var {
+                    value.clone()
+                } else {
+                    expr.clone()
+                }
+            }
+            Expr::Lambda(param, body) => {
+                if param == var {
+                    expr.clone()
+                } else if Self::is_free(param, value) {
+                    let fresh = self.fresh_name(param);
+                    let fresh_body = self.substitute(param, body, &Expr::Var(fresh.clone()));
+                    let fresh_lambda = Expr::Lambda(fresh, Box::new(fresh_body));
+                    self.substitute(var, &fresh_lambda, value)
+                } else {
+                    Expr::Lambda(param.clone(), Box::new(self.substitute(var, body, value)))
+                }
+            }
+            Expr::App(l, r) => Expr::App(
+                Box::new(self.substitute(var, l, value)),
+                Box::new(self.substitute(var, r, value)),
+            ),
+        }
+    }
+}
+
+struct Reducer {
+    max_steps: u32,
+    substituer: Substituer,
+}
+
+impl Reducer {
+    pub fn new(max_steps: u32) -> Self {
+        Self {
+            max_steps,
+            substituer: Substituer::new(),
+        }
+    }
+
+    fn reduce_inner(&mut self, start: &Expr) -> Expr {
+        if self.max_steps > 0 {
+            self.max_steps -= 1;
+        } else {
+            return start.clone();
+        }
+
+        match start {
+            Expr::Var(_) => start.clone(),
+            Expr::Lambda(param, body) => {
+                Expr::Lambda(param.clone(), Box::new(self.reduce_inner(body)))
+            }
+            Expr::App(l, arg) => {
+                let l_reduced = self.reduce_inner(l);
+                match l_reduced {
+                    Expr::Lambda(param, body) => {
+                        let substituted = self.substituer.substitute(&param, &body, &arg);
+                        self.reduce_inner(&substituted)
+                    }
+                    _ => Expr::App(Box::new(l_reduced), Box::new(self.reduce_inner(arg))),
+                }
+            }
+        }
+    }
+
+    pub fn reduce(self, start: &Expr) -> Expr {
+        let mut reducer = Self::new(self.max_steps);
+        reducer.reduce_inner(start)
+    }
+}
+
 fn main() {
     let mut line = String::new();
     io::stdin()
@@ -104,8 +210,9 @@ fn main() {
     if code.peek().is_some() {
         eprintln!("Unexpected char");
     } else {
+        let reducer = Reducer::new(1024);
         match res {
-            Ok(expr) => println!("{:?}", expr),
+            Ok(expr) => println!("Reduced expression: {}", reducer.reduce(&expr)),
             Err(str) => eprintln!("Failed to parse stdin: {}", str),
         }
     }
