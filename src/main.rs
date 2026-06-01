@@ -169,34 +169,23 @@ impl Reducer {
         }
     }
 
-    fn reduce_inner(&mut self, start: &Expr) -> Expr {
-        if self.max_steps > 0 {
-            self.max_steps -= 1;
-        } else {
-            return start.clone();
-        }
-
+    fn reduce_whnf_inner(&mut self, start: &Expr) -> Expr {
         match start {
-            Expr::Var(_) => start.clone(),
-            Expr::Lambda(param, body) => {
-                Expr::Lambda(param.clone(), Box::new(self.reduce_inner(body)))
-            }
+            Expr::Var(..) => start.clone(),
+            Expr::Lambda(..) => start.clone(),
             Expr::App(l, arg) => {
-                let l_reduced = self.reduce_inner(l);
+                let l_reduced = self.reduce_whnf_inner(l);
                 match l_reduced {
-                    Expr::Lambda(param, body) => {
-                        let substituted = self.substituer.substitute(&param, &body, &arg);
-                        self.reduce_inner(&substituted)
-                    }
-                    _ => Expr::App(Box::new(l_reduced), Box::new(self.reduce_inner(arg))),
+                    Expr::Lambda(param, body) => self.substituer.substitute(&param, &body, &arg),
+                    _ => start.clone(),
                 }
             }
         }
     }
 
-    pub fn reduce(self, start: &Expr) -> Expr {
+    pub fn reduce_whnf(self, start: &Expr) -> Expr {
         let mut reducer = Self::new(self.max_steps);
-        reducer.reduce_inner(start)
+        reducer.reduce_whnf_inner(start)
     }
 }
 
@@ -212,7 +201,7 @@ fn main() {
     } else {
         let reducer = Reducer::new(1024);
         match res {
-            Ok(expr) => println!("Reduced expression: {}", reducer.reduce(&expr)),
+            Ok(expr) => println!("Reduced expression (WHNF): {}", reducer.reduce_whnf(&expr)),
             Err(str) => eprintln!("Failed to parse stdin: {}", str),
         }
     }
