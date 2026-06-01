@@ -12,7 +12,7 @@ fn main() -> Result<(), String> {
     let mut line = String::new();
     io::stdin()
         .read_line(&mut line)
-        .expect("Expected to read a line");
+        .map_err(|_| "Expected to read a line")?;
 
     let expr = Parser::parse(&line)?;
     let reducer = Reducer::new();
