@@ -157,14 +157,12 @@ impl Substituer {
 }
 
 struct Reducer {
-    max_steps: u32,
     substituer: Substituer,
 }
 
 impl Reducer {
-    pub fn new(max_steps: u32) -> Self {
+    pub fn new() -> Self {
         Self {
-            max_steps,
             substituer: Substituer::new(),
         }
     }
@@ -176,16 +174,38 @@ impl Reducer {
             Expr::App(l, arg) => {
                 let l_reduced = self.reduce_whnf_inner(l);
                 match l_reduced {
-                    Expr::Lambda(param, body) => self.substituer.substitute(&param, &body, &arg),
+                    Expr::Lambda(param, body) => {
+                        let substituted = self.substituer.substitute(&param, &body, &arg);
+                        self.reduce_whnf_inner(&substituted)
+                    }
                     _ => start.clone(),
                 }
             }
         }
     }
 
-    pub fn reduce_whnf(self, start: &Expr) -> Expr {
-        let mut reducer = Self::new(self.max_steps);
+    fn reduce_nf_inner(&mut self, start: &Expr) -> Expr {
+        let whnf = self.reduce_whnf_inner(start);
+        match whnf {
+            Expr::Lambda(param, body) => {
+                Expr::Lambda(param.clone(), Box::new(self.reduce_nf_inner(&body)))
+            }
+            Expr::App(l, r) => Expr::App(
+                Box::new(self.reduce_nf_inner(&l)),
+                Box::new(self.reduce_nf_inner(&r)),
+            ),
+            Expr::Var(_) => whnf,
+        }
+    }
+
+    pub fn reduce_whnf(&self, start: &Expr) -> Expr {
+        let mut reducer = Self::new();
         reducer.reduce_whnf_inner(start)
+    }
+
+    pub fn reduce_nf(&self, start: &Expr) -> Expr {
+        let mut reducer = Self::new();
+        reducer.reduce_nf_inner(start)
     }
 }
 
@@ -199,9 +219,13 @@ fn main() {
     if code.peek().is_some() {
         eprintln!("Unexpected char");
     } else {
-        let reducer = Reducer::new(1024);
+        let reducer = Reducer::new();
         match res {
-            Ok(expr) => println!("Reduced expression (WHNF): {}", reducer.reduce_whnf(&expr)),
+            Ok(expr) => println!(
+                "Reduced expression (NF) {} and (WHNF) {}",
+                reducer.reduce_nf(&expr),
+                reducer.reduce_whnf(&expr)
+            ),
             Err(str) => eprintln!("Failed to parse stdin: {}", str),
         }
     }
