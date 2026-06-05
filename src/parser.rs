@@ -128,11 +128,11 @@ impl Parser {
                 }
             } else if *char == '(' {
                 code.next().unwrap();
-                let expr = self.parse_inner(code);
+                let expr = self.parse_inner(code)?;
                 if code.next() != Some(')') {
                     return Err("Expected )".to_string());
                 }
-                expr
+                Ok(expr)
             } else {
                 Err("Unexpected symbol".to_string())
             }?;
