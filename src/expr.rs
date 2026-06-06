@@ -26,7 +26,13 @@ pub struct FreeVar {
 }
 
 pub struct Lambda {
-    pub body: Expr,
+    body: Expr,
+}
+
+impl Lambda {
+    pub fn new(body: Expr) -> Self {
+        Self { body }
+    }
 }
 
 #[derive(Clone)]
@@ -34,7 +40,7 @@ pub enum Expr {
     BoundVar(Rc<BoundVar>),
     FreeVar(Rc<FreeVar>),
     Lambda(Rc<Lambda>),
-    App(Rc<Expr>, Rc<Expr>),
+    App(Box<Expr>, Box<Expr>),
 }
 
 struct BvData {

@@ -75,12 +75,10 @@ impl Parser {
         let lambda = Rc::new_cyclic(|weak: &Weak<Lambda>| {
             shadowed = self.params.insert(param.clone(), Weak::clone(weak));
             match self.parse_inner(code) {
-                Ok(body) => Lambda { body },
+                Ok(body) => Lambda::new(body),
                 Err(e) => {
                     parsed = Err(e);
-                    Lambda {
-                        body: Expr::BoundVar(Rc::new(BoundVar::default())),
-                    }
+                    Lambda::new(Expr::BoundVar(Rc::new(BoundVar::default())))
                 }
             }
         });
@@ -137,7 +135,7 @@ impl Parser {
                 Err("Unexpected symbol".to_string())
             }?;
             if let Some(prev_expr) = opt_prev_expr {
-                let new_expr = Expr::App(Rc::new(prev_expr), Rc::new(expr));
+                let new_expr = Expr::App(Box::new(prev_expr), Box::new(expr));
                 opt_prev_expr = Some(new_expr)
             } else {
                 opt_prev_expr = Some(expr)
