@@ -89,5 +89,223 @@ impl Reducer {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::expr::{BoundVar, Expr, Lambda};
+    use crate::parser::Parser;
+    use crate::reducer::Reducer;
+    use std::rc::Rc;
+    // ---------- helpers ----------
+
+    fn parse(s: &str) -> Expr {
+        Parser::parse(s).unwrap_or_else(|e| panic!("parse `{s}` failed: {e}"))
+    }
+
+    fn variant_name(e: &Expr) -> &'static str {
+        match e {
+            Expr::BoundVar(_) => "BoundVar",
+            Expr::FreeVar(_) => "FreeVar",
+            Expr::Lambda(_) => "Lambda",
+            Expr::App(_, _) => "App",
+        }
+    }
+
+    fn as_lambda(e: &Expr) -> Rc<Lambda> {
+        match e {
+            Expr::Lambda(l) => Rc::clone(l),
+            o => panic!("expected Lambda, got {}", variant_name(o)),
+        }
+    }
+    fn as_bound(e: &Expr) -> Rc<BoundVar> {
+        match e {
+            Expr::BoundVar(b) => Rc::clone(b),
+            o => panic!("expected BoundVar, got {}", variant_name(o)),
+        }
+    }
+    fn as_app(e: &Expr) -> (&Expr, &Expr) {
+        match e {
+            Expr::App(l, r) => (l.as_ref(), r.as_ref()),
+            o => panic!("expected App, got {}", variant_name(o)),
+        }
+    }
+
+    /// Structural equality modulo renaming of bound variables.
+    /// Two BoundVars correspond iff their binding lambdas were introduced at
+    /// the same depth in a lockstep traversal — i.e. same De Bruijn level.
+    /// Assumes closed terms (every BoundVar binds within the compared tree).
+    fn alpha_eq(a: &Expr, b: &Expr) -> bool {
+        fn go(a: &Expr, b: &Expr, scope: &mut Vec<(*const Lambda, *const Lambda)>) -> bool {
+            match (a, b) {
+                (Expr::FreeVar(x), Expr::FreeVar(y)) => {
+                    fn strip(n: &str) -> &str {
+                        n.strip_prefix("fv_").unwrap_or(n)
+                    }
+                    strip(&x.name) == strip(&y.name)
+                }
+                (Expr::App(a1, a2), Expr::App(b1, b2)) => go(a1, b1, scope) && go(a2, b2, scope),
+                (Expr::Lambda(la), Expr::Lambda(lb)) => {
+                    scope.push((Rc::as_ptr(la), Rc::as_ptr(lb)));
+                    let r = go(&la.body, &lb.body, scope);
+                    scope.pop();
+                    r
+                }
+                (Expr::BoundVar(ba), Expr::BoundVar(bb)) => {
+                    match (
+                        ba.associated_lambda().upgrade(),
+                        bb.associated_lambda().upgrade(),
+                    ) {
+                        (Some(la), Some(lb)) => {
+                            let (pa, pb) = (Rc::as_ptr(&la), Rc::as_ptr(&lb));
+                            let ia = scope.iter().rposition(|&(s, _)| s == pa);
+                            let ib = scope.iter().rposition(|&(_, s)| s == pb);
+                            ia.is_some() && ia == ib
+                        }
+                        _ => false,
+                    }
+                }
+                _ => false,
+            }
+        }
+        go(a, b, &mut Vec::new())
+    }
+
+    /// Every BoundVar must upgrade (no dangling weak) and bind to an enclosing
+    /// lambda (well-nested scope). The core "memory layout is sane" check.
+    fn assert_well_scoped(expr: &Expr) {
+        fn go(e: &Expr, ancestors: &mut Vec<*const Lambda>) {
+            match e {
+                Expr::FreeVar(_) => {}
+                Expr::App(l, r) => {
+                    go(l, ancestors);
+                    go(r, ancestors);
+                }
+                Expr::Lambda(l) => {
+                    ancestors.push(Rc::as_ptr(l));
+                    go(&l.body, ancestors);
+                    ancestors.pop();
+                }
+                Expr::BoundVar(bv) => {
+                    let lam = bv
+                        .associated_lambda()
+                        .upgrade()
+                        .expect("bound var must point to a live lambda after reduction");
+                    assert!(
+                        ancestors.contains(&Rc::as_ptr(&lam)),
+                        "bound var must bind to an enclosing lambda (well-scoped)"
+                    );
+                }
+            }
+        }
+        go(expr, &mut Vec::new());
+    }
+
+    // ---------- correctness ----------
+
+    #[test]
+    fn identity_of_identity() {
+        let src = "(\\x x) (\\y y)";
+        assert!(alpha_eq(&Reducer::whnf(parse(src)), &parse("\\y y")));
+        assert!(alpha_eq(&Reducer::nf(parse(src)), &parse("\\y y")));
+    }
+
+    #[test]
+    fn whnf_and_nf_differ_under_binder() {
+        // \x ((\y y) z)  — a redex sits under the \x binder; z is free.
+        let src = "\\x ((\\y y) z)";
+        // WHNF reaches the head lambda and stops — body redex untouched.
+        assert!(
+            alpha_eq(&Reducer::whnf(parse(src)), &parse("\\x ((\\y y) z)")),
+            "WHNF must not reduce under the lambda"
+        );
+        // NF reduces the body: (\y y) z -> z.
+        assert!(
+            alpha_eq(&Reducer::nf(parse(src)), &parse("\\x z")),
+            "NF must reduce the redex under the lambda"
+        );
+    }
+
+    #[test]
+    fn nf_computes_successor() {
+        // succ 0 = 1
+        let r = Reducer::nf(parse("(\\n \\f \\x f (n f x)) (\\f \\x x)"));
+        assert!(alpha_eq(&r, &parse("\\f \\x f x")), "succ 0 should be 1");
+    }
+
+    #[test]
+    fn nf_computes_addition() {
+        // plus 1 2 = 3
+        let r = Reducer::nf(parse(
+            "(\\m \\n \\f \\x m f (n f x)) (\\f \\x f x) (\\f \\x f (f x))",
+        ));
+        assert!(
+            alpha_eq(&r, &parse("\\f \\x f (f (f x))")),
+            "1 + 2 should be 3"
+        );
+    }
+
+    #[test]
+    fn nf_computes_multiplication() {
+        // mult 2 3 = 6
+        let r = Reducer::nf(parse(
+            "(\\m \\n \\f m (n f)) (\\f \\x f (f x)) (\\f \\x f (f (f x)))",
+        ));
+        assert!(
+            alpha_eq(&r, &parse("\\f \\x f (f (f (f (f (f x)))))")),
+            "2 * 3 should be 6"
+        );
+    }
+
+    #[test]
+    fn discarded_argument_is_never_forced() {
+        // K I Ω — Ω diverges if forced, but K discards it.
+        // If the reducer evaluated arguments eagerly, these calls would HANG.
+        let src = "(\\x \\y x) (\\a a) ((\\x x x) (\\x x x))";
+        assert!(
+            alpha_eq(&Reducer::whnf(parse(src)), &parse("\\a a")),
+            "WHNF of K I Ω should be I"
+        );
+        assert!(
+            alpha_eq(&Reducer::nf(parse(src)), &parse("\\a a")),
+            "NF of K I Ω should be I"
+        );
+    }
+
+    // ---------- memory layout after reduction ----------
+
+    #[test]
+    fn nf_output_is_well_scoped_and_live() {
+        // A non-trivial reduction result (6); every binding must be sound.
+        let r = Reducer::nf(parse(
+            "(\\m \\n \\f m (n f)) (\\f \\x f (f x)) (\\f \\x f (f (f x)))",
+        ));
+        assert_well_scoped(&r);
+    }
+
+    #[test]
+    fn nf_preserves_bound_var_sharing() {
+        // succ 1 = 2 = \f \x f (f x); the two `f` occurrences in the RESULT
+        // must share one Rc<BoundVar>, not be reallocated independently.
+        let two = Reducer::nf(parse("(\\n \\f \\x f (n f x)) (\\f \\x f x)"));
+        let outer = as_lambda(&two);
+        let inner = as_lambda(&outer.body);
+        let (f1, fx) = as_app(&inner.body);
+        let (f2, _x) = as_app(fx);
+        assert!(
+            Rc::ptr_eq(&as_bound(f1), &as_bound(f2)),
+            "both `f` in the reduced numeral 2 must be one shared Rc<BoundVar>"
+        );
+    }
+
+    #[test]
+    fn dropping_reduced_expr_breaks_cycle() {
+        let weak = {
+            let e = Reducer::nf(parse("(\\x x) (\\y y)")); // \y y
+            Rc::downgrade(&as_lambda(&e))
+        };
+        assert!(
+            weak.upgrade().is_none(),
+            "reduced term must free cleanly once dropped — no leaked cycle"
+        );
     }
 }
