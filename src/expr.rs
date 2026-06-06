@@ -19,6 +19,10 @@ impl BoundVar {
     pub fn associated_lambda(&self) -> Weak<Lambda> {
         self.lambda.borrow().clone()
     }
+
+    pub fn set_lambda(&self, lambda: Weak<Lambda>) {
+        *self.lambda.borrow_mut() = lambda;
+    }
 }
 
 pub struct FreeVar {
