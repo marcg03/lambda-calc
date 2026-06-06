@@ -1,7 +1,6 @@
 mod expr;
 mod parser;
 
-use expr::{Expr, FreeVar, Lambda};
 use parser::Parser;
 use std::io;
 
