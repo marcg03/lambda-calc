@@ -26,12 +26,24 @@ pub struct FreeVar {
 }
 
 pub struct Lambda {
-    body: Expr,
+    pub body: Expr,
+    bound_var: RefCell<Option<Weak<BoundVar>>>,
 }
 
 impl Lambda {
     pub fn new(body: Expr) -> Self {
-        Self { body }
+        Self {
+            body,
+            bound_var: RefCell::new(None),
+        }
+    }
+
+    pub fn associated_bound_var(&self) -> Option<Weak<BoundVar>> {
+        self.bound_var.borrow().clone()
+    }
+
+    pub fn set_bound_var(&self, bound_var: Weak<BoundVar>) {
+        *self.bound_var.borrow_mut() = Some(bound_var);
     }
 }
 
