@@ -1,4 +1,4 @@
-use crate::{Expr, FreeVar, Lambda};
+use crate::expr::{BoundVar, Expr, FreeVar, Lambda};
 use std::collections::HashMap;
 use std::iter::Peekable;
 use std::rc::{Rc, Weak};
@@ -75,13 +75,11 @@ impl Parser {
         let lambda = Rc::new_cyclic(|weak: &Weak<Lambda>| {
             shadowed = self.params.insert(param.clone(), Weak::clone(weak));
             match self.parse_inner(code) {
-                Ok(body) => Lambda {
-                    body: Rc::new(body),
-                },
+                Ok(body) => Lambda { body },
                 Err(e) => {
                     parsed = Err(e);
                     Lambda {
-                        body: Rc::new(Expr::BoundVar(Weak::new())),
+                        body: Expr::BoundVar(Rc::new(BoundVar::default())),
                     }
                 }
             }
@@ -109,7 +107,9 @@ impl Parser {
                 Self::parse_var_string(code).map(|str| {
                     self.params
                         .get(&str)
-                        .and_then(|lambda| Some(Expr::BoundVar(Weak::clone(lambda))))
+                        .and_then(|lambda| {
+                            Some(Expr::BoundVar(Rc::new(BoundVar::new(Weak::clone(lambda)))))
+                        })
                         .unwrap_or({
                             Expr::FreeVar(Rc::clone(
                                 self.free_vars.entry(str).or_insert_with_key(|str| {

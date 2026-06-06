@@ -1,19 +1,37 @@
+use std::cell::RefCell;
 use std::cmp::{Ord, Ordering};
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::rc::{Rc, Weak};
 
-pub struct Lambda {
-    pub body: Rc<Expr>,
+#[derive(Default)]
+pub struct BoundVar {
+    lambda: Rc<RefCell<Weak<Lambda>>>,
+}
+
+impl BoundVar {
+    pub fn new(lambda: Weak<Lambda>) -> Self {
+        Self {
+            lambda: Rc::new(RefCell::new(lambda)),
+        }
+    }
+
+    pub fn associated_lambda(&self) -> Weak<Lambda> {
+        self.lambda.borrow().clone()
+    }
 }
 
 pub struct FreeVar {
     pub name: String,
 }
 
+pub struct Lambda {
+    pub body: Expr,
+}
+
 #[derive(Clone)]
 pub enum Expr {
-    BoundVar(Weak<Lambda>),
+    BoundVar(Rc<BoundVar>),
     FreeVar(Rc<FreeVar>),
     Lambda(Rc<Lambda>),
     App(Rc<Expr>, Rc<Expr>),
@@ -21,12 +39,12 @@ pub enum Expr {
 
 struct BvData {
     pub depth: u32,
-    pub bv: Weak<Lambda>,
+    pub bv: Rc<BoundVar>,
 }
 
 impl PartialEq for BvData {
     fn eq(&self, other: &Self) -> bool {
-        self.depth == other.depth && Weak::ptr_eq(&self.bv, &other.bv)
+        self.depth == other.depth && Rc::ptr_eq(&self.bv, &other.bv)
     }
 }
 
@@ -40,9 +58,12 @@ impl PartialOrd for BvData {
 
 impl Ord for BvData {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.depth
-            .cmp(&other.depth)
-            .then_with(|| self.bv.as_ptr().cmp(&other.bv.as_ptr()))
+        self.depth.cmp(&other.depth).then_with(|| {
+            self.bv
+                .associated_lambda()
+                .as_ptr()
+                .cmp(&other.bv.associated_lambda().as_ptr())
+        })
     }
 }
 
@@ -64,10 +85,10 @@ fn display_expr(
     f: &mut fmt::Formatter<'_>,
 ) -> fmt::Result {
     match expr {
-        Expr::BoundVar(lambda) => {
+        Expr::BoundVar(bv) => {
             let name = names
-                .get(&Weak::as_ptr(lambda))
-                .expect("Expected named lambda");
+                .get(&Weak::as_ptr(&bv.associated_lambda()))
+                .expect("Expected associated lambda");
             write!(f, "{}", name)
         }
         Expr::Lambda(lambda) => {
@@ -150,10 +171,10 @@ fn collect_parents(
 ) {
     match expr {
         Expr::BoundVar(bv) => {
-            if let Some(&binder_depth) = depths.get(&bv.as_ptr()) {
+            if let Some(&binder_depth) = depths.get(&Weak::as_ptr(&bv.associated_lambda())) {
                 bound_vars.insert(BvData {
                     depth: binder_depth,
-                    bv: Weak::clone(bv),
+                    bv: Rc::clone(bv),
                 });
             }
         }
@@ -165,7 +186,10 @@ fn collect_parents(
                 bound_vars.pop_last();
             }
             if let Some(nearest) = bound_vars.last() {
-                parents.insert(Rc::as_ptr(lambda), Weak::clone(&nearest.bv));
+                parents.insert(
+                    Rc::as_ptr(lambda),
+                    Weak::clone(&nearest.bv.associated_lambda()),
+                );
             }
         }
         Expr::App(l, r) => {
