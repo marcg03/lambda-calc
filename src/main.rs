@@ -1,9 +1,8 @@
 mod expr;
 mod parser;
-mod reducer;
 
+use expr::Reducer;
 use parser::Parser;
-use reducer::Reducer;
 use std::io;
 
 fn main() -> Result<(), String> {
@@ -13,10 +12,8 @@ fn main() -> Result<(), String> {
         .map_err(|_| "Expected to read line")?;
     let parsed_expr = Parser::parse(&line)?;
 
-    let whnf = Reducer::whnf(parsed_expr.clone());
-    println!("WHNF: {}", whnf);
-
-    let nf = Reducer::nf(parsed_expr);
-    println!("NF:   {}", nf);
+    println!("Parsed expression: {}", parsed_expr);
+    // FIX: this is not really WHNF
+    println!("WHNF   expression: {}", Reducer::whnf(parsed_expr));
     Ok(())
 }

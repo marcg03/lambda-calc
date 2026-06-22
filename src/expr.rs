@@ -4,7 +4,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::rc::{Rc, Weak};
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct BoundVar {
     lambda: Rc<RefCell<Weak<Lambda>>>,
 }
@@ -19,16 +19,14 @@ impl BoundVar {
     pub fn associated_lambda(&self) -> Weak<Lambda> {
         self.lambda.borrow().clone()
     }
-
-    pub fn set_lambda(&self, lambda: Weak<Lambda>) {
-        *self.lambda.borrow_mut() = lambda;
-    }
 }
 
+#[derive(Debug)]
 pub struct FreeVar {
     pub name: String,
 }
 
+#[derive(Debug)]
 pub struct Lambda {
     pub body: Expr,
     bound_var: RefCell<Option<Weak<BoundVar>>>,
@@ -51,12 +49,103 @@ impl Lambda {
     }
 }
 
-#[derive(Clone)]
+type Env = HashMap<*const BoundVar, Expr>;
+
+#[derive(Debug)]
+enum ThunkState {
+    Forced(Expr),
+    Unforced(Expr),
+}
+
+#[derive(Debug)]
+pub struct Thunk {
+    state: RefCell<ThunkState>,
+    env: Env,
+}
+
+impl Thunk {
+    fn new(expr: Expr, env: Env) -> Self {
+        Self {
+            state: RefCell::new(ThunkState::Unforced(expr)),
+            env,
+        }
+    }
+
+    fn find(bv: *const BoundVar, env: &Env) -> Option<Expr> {
+        env.get(&bv).cloned()
+    }
+
+    fn reduce(expr: Expr, env: &mut Env) -> Expr {
+        match expr {
+            Expr::BoundVar(ref bv) => {
+                if let Some(val) = Self::find(Rc::as_ptr(bv), env) {
+                    Self::reduce(val, env)
+                } else {
+                    expr
+                }
+            }
+            Expr::FreeVar(..) => expr,
+            Expr::Lambda(..) => expr,
+            Expr::App(l, r) => {
+                let l_reduced = Self::reduce(*l, env);
+                if let Expr::Lambda(l) = l_reduced {
+                    let bv = if let Some(bv) = l.associated_bound_var() {
+                        bv.upgrade().expect("expected boundvar to exist")
+                    } else {
+                        return Self::reduce(l.body.clone(), env);
+                    };
+
+                    // wrap `r` in a thunk (snapshot crt env)
+                    let thunk = Expr::Thunk(Rc::new(Self::new(*r, env.clone())));
+                    // add that thunk to env
+                    env.insert(Rc::as_ptr(&bv), thunk);
+                    // reduce the body of the lambda with the new env
+                    let expr = Self::reduce(l.body.clone(), env);
+                    env.remove(&Rc::as_ptr(&bv));
+                    expr
+                } else {
+                    let thunk = Expr::Thunk(Rc::new(Self::new(*r, env.clone())));
+                    Expr::App(Box::new(l_reduced), Box::new(thunk))
+                }
+            }
+            Expr::Thunk(thunk) => Self::reduce(thunk.get(), env),
+        }
+    }
+
+    fn get(&self) -> Expr {
+        let mut state = self.state.borrow_mut();
+        let expr = match &*state {
+            ThunkState::Forced(expr) => return expr.clone(),
+            ThunkState::Unforced(expr) => expr.clone(),
+        };
+        let mut env = self.env.clone(); // PERF: this could be really slow
+        let expr = Self::reduce(expr, &mut env);
+        *state = ThunkState::Forced(expr.clone());
+        expr
+    }
+
+    fn whnf(expr: Expr) -> Expr {
+        let mut env = Env::new();
+        let expr = Self::reduce(expr, &mut env);
+        expr
+    }
+}
+
+pub struct Reducer;
+
+impl Reducer {
+    pub fn whnf(expr: Expr) -> Expr {
+        Thunk::whnf(expr)
+    }
+}
+
+#[derive(Clone, Debug)]
 pub enum Expr {
     BoundVar(Rc<BoundVar>),
     FreeVar(Rc<FreeVar>),
     Lambda(Rc<Lambda>),
     App(Box<Expr>, Box<Expr>),
+    Thunk(Rc<Thunk>),
 }
 
 struct BvData {
@@ -135,6 +224,9 @@ fn display_expr(
             display_expr(r, names, f)?;
             write!(f, ")")
         }
+        Expr::Thunk(thunk) => {
+            write!(f, "{}", thunk.get())
+        }
     }
 }
 
@@ -144,6 +236,8 @@ pub fn name_lambdas(
     parents: &HashMap<*const Lambda, Weak<Lambda>>,
 ) {
     match expr {
+        Expr::BoundVar(..) => {}
+        Expr::FreeVar(..) => {}
         Expr::Lambda(lambda) => {
             ensure_named(lambda, names, parents);
             name_lambdas(&lambda.body, names, parents);
@@ -152,7 +246,9 @@ pub fn name_lambdas(
             name_lambdas(l, names, parents);
             name_lambdas(r, names, parents);
         }
-        _ => {}
+        Expr::Thunk(thunk) => {
+            name_lambdas(&thunk.get(), names, parents);
+        }
     }
 }
 
@@ -218,5 +314,16 @@ fn collect_parents(
             collect_parents(l, bound_vars, parents, depths, depth);
             collect_parents(r, bound_vars, parents, depths, depth);
         }
+        Expr::Thunk(thunk) => {
+            collect_parents(&thunk.get(), bound_vars, parents, depths, depth);
+        }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test() {}
 }

@@ -253,6 +253,7 @@ mod tests {
             Expr::FreeVar(_) => "FreeVar",
             Expr::Lambda(_) => "Lambda",
             Expr::App(_, _) => "App",
+            Expr::Thunk(_) => "Thunk",
         }
     }
 
