@@ -124,6 +124,14 @@ impl Thunk {
         expr
     }
 
+    fn get_unforced(&self) -> Expr {
+        let state = self.state.borrow();
+        match &*state {
+            ThunkState::Forced(expr) => expr.clone(),
+            ThunkState::Unforced(expr) => expr.clone(),
+        }
+    }
+
     fn whnf(expr: Expr) -> Expr {
         let mut env = Env::new();
         let expr = Self::reduce(expr, &mut env);
@@ -225,7 +233,7 @@ fn display_expr(
             write!(f, ")")
         }
         Expr::Thunk(thunk) => {
-            write!(f, "{}", thunk.get())
+            write!(f, "{}", thunk.get_unforced())
         }
     }
 }
