@@ -1,6 +1,5 @@
 use std::cell::RefCell;
-use std::cmp::{Ord, Ordering};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::fmt;
 use std::rc::{Rc, Weak};
 
@@ -60,14 +59,14 @@ enum ThunkState {
 #[derive(Debug)]
 pub struct Thunk {
     state: RefCell<ThunkState>,
-    env: Env,
+    env: RefCell<Env>,
 }
 
 impl Thunk {
     fn new(expr: Expr, env: Env) -> Self {
         Self {
             state: RefCell::new(ThunkState::Unforced(expr)),
-            env,
+            env: RefCell::new(env),
         }
     }
 
@@ -78,72 +77,98 @@ impl Thunk {
     fn reduce(expr: Expr, env: &mut Env) -> Expr {
         match expr {
             Expr::BoundVar(ref bv) => {
-                if let Some(val) = Self::find(Rc::as_ptr(bv), env) {
-                    Self::reduce(val, env)
+                if let Some(val) = Thunk::find(Rc::as_ptr(bv), env) {
+                    Thunk::reduce(val, env)
                 } else {
                     expr
                 }
             }
             Expr::FreeVar(..) => expr,
-            Expr::Lambda(..) => expr,
+            Expr::Lambda(..) => {
+                if env.is_empty() {
+                    expr
+                } else {
+                    Expr::Thunk(Rc::new(Thunk::new(expr, env.clone())))
+                }
+            }
             Expr::App(l, r) => {
-                let l_reduced = Self::reduce(*l, env);
+                let l_reduced = Thunk::reduce(*l, env);
+                let initial_env = env.clone();
+                let l_reduced = if let Expr::Thunk(thunk) = &l_reduced {
+                    thunk.force();
+                    env.extend(thunk.env.borrow().clone());
+                    thunk.expr()
+                } else {
+                    l_reduced
+                };
+
                 if let Expr::Lambda(l) = l_reduced {
                     let bv = if let Some(bv) = l.associated_bound_var() {
-                        bv.upgrade().expect("expected boundvar to exist")
+                        bv
                     } else {
-                        return Self::reduce(l.body.clone(), env);
+                        let result = Thunk::reduce(l.body.clone(), env);
+                        *env = initial_env;
+                        return result;
                     };
 
                     // wrap `r` in a thunk (snapshot crt env)
-                    let thunk = Expr::Thunk(Rc::new(Self::new(*r, env.clone())));
+                    let thunk = if env.is_empty() {
+                        *r
+                    } else {
+                        Expr::Thunk(Rc::new(Thunk::new(*r, env.clone())))
+                    };
                     // add that thunk to env
-                    env.insert(Rc::as_ptr(&bv), thunk);
+                    env.insert(Weak::as_ptr(&bv), thunk);
                     // reduce the body of the lambda with the new env
-                    let expr = Self::reduce(l.body.clone(), env);
-                    env.remove(&Rc::as_ptr(&bv));
+                    let expr = Thunk::reduce(l.body.clone(), env);
+                    *env = initial_env;
                     expr
                 } else {
-                    let thunk = Expr::Thunk(Rc::new(Self::new(*r, env.clone())));
+                    let thunk = Expr::Thunk(Rc::new(Thunk::new(*r, env.clone())));
+                    *env = initial_env;
                     Expr::App(Box::new(l_reduced), Box::new(thunk))
                 }
             }
-            Expr::Thunk(thunk) => Self::reduce(thunk.get(), env),
+            Expr::Thunk(thunk) => {
+                thunk.force();
+                let initial_env = env.clone();
+                env.extend(thunk.env.borrow().clone());
+                let result = Thunk::reduce(thunk.expr(), env);
+                *env = initial_env;
+                result
+            }
         }
     }
 
-    fn get(&self) -> Expr {
+    pub fn force(&self) {
         let mut state = self.state.borrow_mut();
         let expr = match &*state {
-            ThunkState::Forced(expr) => return expr.clone(),
+            ThunkState::Forced(..) => return,
             ThunkState::Unforced(expr) => expr.clone(),
         };
-        let mut env = self.env.clone(); // PERF: this could be really slow
-        let expr = Self::reduce(expr, &mut env);
-        *state = ThunkState::Forced(expr.clone());
-        expr
+        let mut env = self.env.borrow_mut();
+        let mut expr = Thunk::reduce(expr, &mut *env);
+        if let Expr::Thunk(nested) = expr {
+            env.extend(nested.env.borrow().clone());
+            expr = nested.expr();
+        }
+        *state = ThunkState::Forced(expr);
     }
 
-    fn get_unforced(&self) -> Expr {
+    fn expr(&self) -> Expr {
         let state = self.state.borrow();
         match &*state {
             ThunkState::Forced(expr) => expr.clone(),
             ThunkState::Unforced(expr) => expr.clone(),
         }
     }
-
-    fn whnf(expr: Expr) -> Expr {
-        let mut env = Env::new();
-        let expr = Self::reduce(expr, &mut env);
-        expr
-    }
 }
 
 pub struct Reducer;
-
 impl Reducer {
     pub fn whnf(expr: Expr) -> Expr {
-        Thunk::whnf(expr)
+        let mut env = Env::new();
+        Thunk::reduce(expr, &mut env)
     }
 }
 
@@ -156,174 +181,268 @@ pub enum Expr {
     Thunk(Rc<Thunk>),
 }
 
-struct BvData {
-    pub depth: u32,
-    pub bv: Rc<BoundVar>,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl PartialEq for BvData {
-    fn eq(&self, other: &Self) -> bool {
-        self.depth == other.depth && Rc::ptr_eq(&self.bv, &other.bv)
+    // --- term builders -------------------------------------------------
+
+    /// A fresh, distinct bound variable. Its back-edge to a Lambda is left
+    /// dangling because `reduce` never reads BoundVar -> Lambda, only the
+    /// Lambda -> BoundVar weak and the occurrence's Rc pointer.
+    fn fresh_bv() -> Rc<BoundVar> {
+        Rc::new(BoundVar::default())
     }
-}
 
-impl Eq for BvData {}
-
-impl PartialOrd for BvData {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
+    /// λ binding `bv`, with the given body. Wires the binder so that
+    /// `Weak::as_ptr(associated_bound_var)` == `Rc::as_ptr(var(&bv))`.
+    fn lam(bv: &Rc<BoundVar>, body: Expr) -> Expr {
+        let l = Rc::new(Lambda::new(body));
+        l.set_bound_var(Rc::downgrade(bv));
+        Expr::Lambda(l)
     }
-}
 
-impl Ord for BvData {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.depth.cmp(&other.depth).then_with(|| {
-            self.bv
-                .associated_lambda()
-                .as_ptr()
-                .cmp(&other.bv.associated_lambda().as_ptr())
-        })
+    fn var(bv: &Rc<BoundVar>) -> Expr {
+        Expr::BoundVar(bv.clone())
+    }
+
+    fn free(name: &str) -> Expr {
+        Expr::FreeVar(Rc::new(FreeVar {
+            name: name.to_string(),
+        }))
+    }
+
+    fn app(l: Expr, r: Expr) -> Expr {
+        Expr::App(Box::new(l), Box::new(r))
+    }
+
+    /// Peel any thunk wrapping and report a FreeVar's name, forcing as needed.
+    fn free_name(e: &Expr) -> Option<String> {
+        match e {
+            Expr::FreeVar(fv) => Some(fv.name.clone()),
+            Expr::Thunk(t) => {
+                t.force();
+                free_name(&t.expr())
+            }
+            _ => None,
+        }
+    }
+
+    // --- tests ---------------------------------------------------------
+
+    #[test]
+    fn identity_applied_to_free_var() {
+        // (\x. x) f  ==>  f
+        let x = fresh_bv();
+        let id = lam(&x, var(&x));
+        let result = Reducer::whnf(app(id, free("f")));
+        assert_eq!(free_name(&result).as_deref(), Some("f"));
+    }
+
+    #[test]
+    fn k_combinator_selects_first_arg() {
+        // (\x. \y. x) f g  ==>  f
+        let x = fresh_bv();
+        let y = fresh_bv();
+        let k = lam(&x, lam(&y, var(&x)));
+        let result = Reducer::whnf(app(app(k, free("f")), free("g")));
+        assert_eq!(free_name(&result).as_deref(), Some("f"));
+    }
+
+    #[test]
+    fn second_arg_selected() {
+        // (\x. \y. y) f g  ==>  g
+        let x = fresh_bv();
+        let y = fresh_bv();
+        let k2 = lam(&x, lam(&y, var(&y)));
+        let result = Reducer::whnf(app(app(k2, free("f")), free("g")));
+        assert_eq!(free_name(&result).as_deref(), Some("g"));
+    }
+
+    #[test]
+    fn argument_is_reduced_when_used() {
+        // (\x. x) ((\y. y) f)  ==>  f
+        let x = fresh_bv();
+        let y = fresh_bv();
+        let id_x = lam(&x, var(&x));
+        let id_y = lam(&y, var(&y));
+        let result = Reducer::whnf(app(id_x, app(id_y, free("f"))));
+        assert_eq!(free_name(&result).as_deref(), Some("f"));
+    }
+
+    #[test]
+    fn unused_argument_is_not_evaluated() {
+        // (\z. a) Ω  ==>  a   — must NOT diverge.
+        // If the reducer were strict, this test would hang forever.
+        let z = fresh_bv();
+        let const_a = lam(&z, free("a"));
+
+        // Ω = (\x. x x) (\x. x x)
+        let x = fresh_bv();
+        let omega = lam(&x, app(var(&x), var(&x)));
+        let big = app(omega.clone(), omega);
+
+        let result = Reducer::whnf(app(const_a, big));
+        assert_eq!(free_name(&result).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn neutral_application_is_stuck() {
+        // f g  ==>  f g   (head is free, nothing to apply)
+        let result = Reducer::whnf(app(free("f"), free("g")));
+        match result {
+            Expr::App(l, r) => {
+                assert_eq!(free_name(&l).as_deref(), Some("f"));
+                assert_eq!(free_name(&r).as_deref(), Some("g"));
+            }
+            other => panic!("expected a stuck application, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn lambda_is_already_whnf() {
+        // \x. x is already in WHNF; reducing returns a lambda unchanged.
+        let x = fresh_bv();
+        let id = lam(&x, var(&x));
+        match Reducer::whnf(id) {
+            Expr::Lambda(_) => {}
+            other => panic!("expected lambda, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn nested_redex_in_argument_position() {
+        // (\x. \y. y) g ((\z. z) f)  ==>  ((\z. z) f) ... no:
+        // head (\x.\y.y) g  ==>  \y. y, then applied to ((\z.z) f)  ==>  f
+        let x = fresh_bv();
+        let y = fresh_bv();
+        let z = fresh_bv();
+        let snd = lam(&x, lam(&y, var(&y)));
+        let id_z = lam(&z, var(&z));
+        let result = Reducer::whnf(app(app(snd, free("g")), app(id_z, free("f"))));
+        assert_eq!(free_name(&result).as_deref(), Some("f"));
+    }
+
+    #[test]
+    fn shared_argument_forced_once() {
+        // (\x. x) applied to a thunk should force, but forcing is idempotent:
+        // reducing the same result twice must agree. Guards the Forced/Unforced cache.
+        let x = fresh_bv();
+        let y = fresh_bv();
+        let id = lam(&x, var(&x));
+        let inner = app(lam(&y, var(&y)), free("f"));
+        let result = Reducer::whnf(app(id, inner));
+        assert_eq!(free_name(&result).as_deref(), Some("f"));
+        // idempotent read
+        assert_eq!(free_name(&result).as_deref(), Some("f"));
+    }
+
+    #[test]
+    fn applied_under_neutral_head_keeps_both_args() {
+        // f a b  ==>  f a b  (spine stays intact, left-assoc)
+        let result = Reducer::whnf(app(app(free("f"), free("a")), free("b")));
+        match result {
+            Expr::App(l, r) => {
+                assert_eq!(free_name(&r).as_deref(), Some("b"));
+                match *l {
+                    Expr::App(ref ll, ref lr) => {
+                        assert_eq!(free_name(ll).as_deref(), Some("f"));
+                        assert_eq!(free_name(lr).as_deref(), Some("a"));
+                    }
+                    ref other => panic!("expected nested app, got {other}"),
+                }
+            }
+            other => panic!("expected spine, got {other}"),
+        }
+    }
+
+    #[test]
+    fn display_of_identity_is_stable() {
+        let x = fresh_bv();
+        let id = lam(&x, var(&x));
+        assert_eq!(format!("{id}"), "\\a a");
     }
 }
 
 impl fmt::Display for Expr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut bound_vars = BTreeSet::new();
-        let mut parents = HashMap::new();
-        let mut depths = HashMap::new();
-        collect_parents(self, &mut bound_vars, &mut parents, &mut depths, 0);
-        let mut names = HashMap::new();
-        name_lambdas(self, &mut names, &parents);
-        display_expr(self, &names, f)
+        let mut names: HashMap<*const BoundVar, String> = HashMap::new();
+        let mut next = String::from("a");
+        self.pp(f, &mut names, &mut next, 0)
     }
 }
 
-fn display_expr(
-    expr: &Expr,
-    names: &HashMap<*const Lambda, String>,
-    f: &mut fmt::Formatter<'_>,
-) -> fmt::Result {
-    match expr {
-        Expr::BoundVar(bv) => {
-            let name = names
-                .get(&Weak::as_ptr(&bv.associated_lambda()))
-                .expect("Expected associated lambda");
-            write!(f, "{}", name)
+impl Expr {
+    /// Precedence of this node: atom = 2, application = 1, lambda = 0.
+    fn prec(&self) -> u8 {
+        match self {
+            Expr::BoundVar(_) | Expr::FreeVar(_) => 2,
+            Expr::App(..) => 1,
+            Expr::Lambda(_) => 0,
+            Expr::Thunk(_) => 2, // never used; thunks are transparent in `pp`
         }
-        Expr::Lambda(lambda) => {
-            let name = names
-                .get(&Rc::as_ptr(lambda))
-                .expect("Expected named lambda");
-            write!(f, "(\\{} ", name)?;
-            display_expr(&lambda.body, names, f)?;
-            write!(f, ")")
+    }
+
+    /// Print, wrapping in parens if this node binds looser than `min_prec`.
+    fn pp(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+        names: &mut HashMap<*const BoundVar, String>,
+        next: &mut String,
+        min_prec: u8,
+    ) -> fmt::Result {
+        if let Expr::Thunk(..) = self {
+            return write!(f, "<unevaluated-thunk>");
         }
-        Expr::FreeVar(fv) => {
-            if fv.name.starts_with("fv_") {
-                write!(f, "{}", fv.name)
-            } else {
-                write!(f, "fv_{}", fv.name)
-            }
-        }
-        Expr::App(l, r) => {
+
+        let needs_parens = self.prec() < min_prec;
+        if needs_parens {
             write!(f, "(")?;
-            display_expr(l, names, f)?;
-            write!(f, " ")?;
-            display_expr(r, names, f)?;
-            write!(f, ")")
         }
-        Expr::Thunk(thunk) => {
-            write!(f, "{}", thunk.get_unforced())
-        }
-    }
-}
-
-pub fn name_lambdas(
-    expr: &Expr,
-    names: &mut HashMap<*const Lambda, String>,
-    parents: &HashMap<*const Lambda, Weak<Lambda>>,
-) {
-    match expr {
-        Expr::BoundVar(..) => {}
-        Expr::FreeVar(..) => {}
-        Expr::Lambda(lambda) => {
-            ensure_named(lambda, names, parents);
-            name_lambdas(&lambda.body, names, parents);
-        }
-        Expr::App(l, r) => {
-            name_lambdas(l, names, parents);
-            name_lambdas(r, names, parents);
-        }
-        Expr::Thunk(thunk) => {
-            name_lambdas(&thunk.get(), names, parents);
-        }
-    }
-}
-
-fn ensure_named(
-    lambda: &Rc<Lambda>,
-    names: &mut HashMap<*const Lambda, String>,
-    parents: &HashMap<*const Lambda, Weak<Lambda>>,
-) -> String {
-    let key = Rc::as_ptr(lambda);
-    if let Some(name) = names.get(&key) {
-        return name.clone();
-    }
-    let name = match parents.get(&key) {
-        Some(parent) => {
-            let parent_rc = parent.upgrade().expect("parent lambda dropped");
-            let parent_name = ensure_named(&parent_rc, names, parents);
-            match parent_name.as_bytes().last().unwrap() {
-                b'z' => format!("{parent_name}a"),
-                &c => format!(
-                    "{}{}",
-                    &parent_name[..parent_name.len() - 1],
-                    char::from(c + 1)
-                ),
+        match self {
+            Expr::BoundVar(bv) => match names.get(&Rc::as_ptr(bv)) {
+                Some(name) => write!(f, "{name}")?,
+                None => write!(f, "_")?, // bound var with no binder in scope
+            },
+            Expr::FreeVar(fv) => {
+                if fv.name.starts_with("fv_") {
+                    write!(f, "{}", fv.name)?
+                } else {
+                    write!(f, "fv_{}", fv.name)?
+                }
             }
+            Expr::Lambda(l) => {
+                let name = fresh(next);
+                if let Some(w) = l.associated_bound_var() {
+                    names.insert(Weak::as_ptr(&w), name.clone());
+                }
+                write!(f, "\\{name} ")?;
+                l.body.pp(f, names, next, 0)?; // body never needs parens
+            }
+            Expr::App(lhs, rhs) => {
+                lhs.pp(f, names, next, 1)?; // fn position: parenthesize lambdas
+                write!(f, " ")?;
+                rhs.pp(f, names, next, 2)?; // arg position: parenthesize app/lambda
+            }
+            Expr::Thunk(_) => unreachable!("handled above"),
         }
-        None => "a".to_string(),
-    };
-    names.insert(key, name.clone());
+        if needs_parens {
+            write!(f, ")")?;
+        }
+        Ok(())
+    }
+}
+
+/// Fresh variable name: a, b, …, z, aa, ab, … (your `get_next` scheme).
+fn fresh(next: &mut String) -> String {
+    let name = next.clone();
+    if next.ends_with('z') {
+        *next = "a".repeat(next.len() + 1);
+    } else {
+        let mut bytes = std::mem::take(next).into_bytes();
+        let n = bytes.len();
+        bytes[n - 1] += 1;
+        *next = String::from_utf8(bytes).unwrap();
+    }
     name
-}
-
-fn collect_parents(
-    expr: &Expr,
-    bound_vars: &mut BTreeSet<BvData>,
-    parents: &mut HashMap<*const Lambda, Weak<Lambda>>,
-    depths: &mut HashMap<*const Lambda, u32>,
-    depth: u32,
-) {
-    match expr {
-        Expr::BoundVar(bv) => {
-            if let Some(&binder_depth) = depths.get(&Weak::as_ptr(&bv.associated_lambda())) {
-                bound_vars.insert(BvData {
-                    depth: binder_depth,
-                    bv: Rc::clone(bv),
-                });
-            }
-        }
-        Expr::FreeVar(..) => {}
-        Expr::Lambda(lambda) => {
-            depths.insert(Rc::as_ptr(lambda), depth);
-            collect_parents(&lambda.body, bound_vars, parents, depths, depth + 1);
-            while bound_vars.last().is_some_and(|x| x.depth >= depth) {
-                bound_vars.pop_last();
-            }
-            if let Some(nearest) = bound_vars.last() {
-                parents.insert(
-                    Rc::as_ptr(lambda),
-                    Weak::clone(&nearest.bv.associated_lambda()),
-                );
-            }
-        }
-        Expr::App(l, r) => {
-            collect_parents(l, bound_vars, parents, depths, depth);
-            collect_parents(r, bound_vars, parents, depths, depth);
-        }
-        Expr::Thunk(thunk) => {
-            collect_parents(&thunk.get(), bound_vars, parents, depths, depth);
-        }
-    }
 }

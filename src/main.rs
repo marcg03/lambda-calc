@@ -13,7 +13,6 @@ fn main() -> Result<(), String> {
     let parsed_expr = Parser::parse(&line)?;
 
     println!("Parsed expression: {}", parsed_expr);
-    // FIX: this is not really WHNF
     println!("WHNF   expression: {}", Reducer::whnf(parsed_expr));
     Ok(())
 }
