@@ -198,8 +198,8 @@ impl Expr {
         next: &mut String,
         min_prec: u8,
     ) -> fmt::Result {
-        if let Expr::Thunk(..) = self {
-            return write!(f, "<unevaluated-thunk>");
+        if let Expr::Thunk(thunk) = self {
+            return write!(f, "<thunk>({})", thunk.expr());
         }
 
         let needs_parens = self.prec() < min_prec;
