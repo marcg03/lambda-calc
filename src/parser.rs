@@ -81,7 +81,7 @@ impl Parser {
                 Ok(body) => Lambda::new(body),
                 Err(e) => {
                     parsed = Err(e);
-                    Lambda::new(Expr::BoundVar(Rc::new(BoundVar::default())))
+                    Lambda::new(Expr::BoundVar(Rc::new(BoundVar::new())))
                 }
             }
         });
@@ -114,7 +114,7 @@ impl Parser {
                         .as_ref()
                         .map(|bv| bv.upgrade().expect("Expected lambda to have bound var"))
                         .unwrap_or_else(|| {
-                            let bound_var = Rc::new(BoundVar::new(Weak::clone(&lambda)));
+                            let bound_var = Rc::new(BoundVar::new());
                             self.params.insert(
                                 str.clone(),
                                 (

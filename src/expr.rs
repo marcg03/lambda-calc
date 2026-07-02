@@ -3,20 +3,12 @@ use std::collections::HashMap;
 use std::fmt;
 use std::rc::{Rc, Weak};
 
-#[derive(Default, Debug)]
-pub struct BoundVar {
-    lambda: Rc<RefCell<Weak<Lambda>>>,
-}
+#[derive(Debug)]
+pub struct BoundVar;
 
 impl BoundVar {
-    pub fn new(lambda: Weak<Lambda>) -> Self {
-        Self {
-            lambda: Rc::new(RefCell::new(lambda)),
-        }
-    }
-
-    pub fn associated_lambda(&self) -> Weak<Lambda> {
-        self.lambda.borrow().clone()
+    pub fn new() -> Self {
+        Self {}
     }
 }
 
