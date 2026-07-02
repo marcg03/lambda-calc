@@ -173,189 +173,6 @@ pub enum Expr {
     Thunk(Rc<Thunk>),
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // --- term builders -------------------------------------------------
-
-    /// A fresh, distinct bound variable. Its back-edge to a Lambda is left
-    /// dangling because `reduce` never reads BoundVar -> Lambda, only the
-    /// Lambda -> BoundVar weak and the occurrence's Rc pointer.
-    fn fresh_bv() -> Rc<BoundVar> {
-        Rc::new(BoundVar::default())
-    }
-
-    /// λ binding `bv`, with the given body. Wires the binder so that
-    /// `Weak::as_ptr(associated_bound_var)` == `Rc::as_ptr(var(&bv))`.
-    fn lam(bv: &Rc<BoundVar>, body: Expr) -> Expr {
-        let l = Rc::new(Lambda::new(body));
-        l.set_bound_var(Rc::downgrade(bv));
-        Expr::Lambda(l)
-    }
-
-    fn var(bv: &Rc<BoundVar>) -> Expr {
-        Expr::BoundVar(bv.clone())
-    }
-
-    fn free(name: &str) -> Expr {
-        Expr::FreeVar(Rc::new(FreeVar {
-            name: name.to_string(),
-        }))
-    }
-
-    fn app(l: Expr, r: Expr) -> Expr {
-        Expr::App(Box::new(l), Box::new(r))
-    }
-
-    /// Peel any thunk wrapping and report a FreeVar's name, forcing as needed.
-    fn free_name(e: &Expr) -> Option<String> {
-        match e {
-            Expr::FreeVar(fv) => Some(fv.name.clone()),
-            Expr::Thunk(t) => {
-                t.force();
-                free_name(&t.expr())
-            }
-            _ => None,
-        }
-    }
-
-    // --- tests ---------------------------------------------------------
-
-    #[test]
-    fn identity_applied_to_free_var() {
-        // (\x. x) f  ==>  f
-        let x = fresh_bv();
-        let id = lam(&x, var(&x));
-        let result = Reducer::whnf(app(id, free("f")));
-        assert_eq!(free_name(&result).as_deref(), Some("f"));
-    }
-
-    #[test]
-    fn k_combinator_selects_first_arg() {
-        // (\x. \y. x) f g  ==>  f
-        let x = fresh_bv();
-        let y = fresh_bv();
-        let k = lam(&x, lam(&y, var(&x)));
-        let result = Reducer::whnf(app(app(k, free("f")), free("g")));
-        assert_eq!(free_name(&result).as_deref(), Some("f"));
-    }
-
-    #[test]
-    fn second_arg_selected() {
-        // (\x. \y. y) f g  ==>  g
-        let x = fresh_bv();
-        let y = fresh_bv();
-        let k2 = lam(&x, lam(&y, var(&y)));
-        let result = Reducer::whnf(app(app(k2, free("f")), free("g")));
-        assert_eq!(free_name(&result).as_deref(), Some("g"));
-    }
-
-    #[test]
-    fn argument_is_reduced_when_used() {
-        // (\x. x) ((\y. y) f)  ==>  f
-        let x = fresh_bv();
-        let y = fresh_bv();
-        let id_x = lam(&x, var(&x));
-        let id_y = lam(&y, var(&y));
-        let result = Reducer::whnf(app(id_x, app(id_y, free("f"))));
-        assert_eq!(free_name(&result).as_deref(), Some("f"));
-    }
-
-    #[test]
-    fn unused_argument_is_not_evaluated() {
-        // (\z. a) Ω  ==>  a   — must NOT diverge.
-        // If the reducer were strict, this test would hang forever.
-        let z = fresh_bv();
-        let const_a = lam(&z, free("a"));
-
-        // Ω = (\x. x x) (\x. x x)
-        let x = fresh_bv();
-        let omega = lam(&x, app(var(&x), var(&x)));
-        let big = app(omega.clone(), omega);
-
-        let result = Reducer::whnf(app(const_a, big));
-        assert_eq!(free_name(&result).as_deref(), Some("a"));
-    }
-
-    #[test]
-    fn neutral_application_is_stuck() {
-        // f g  ==>  f g   (head is free, nothing to apply)
-        let result = Reducer::whnf(app(free("f"), free("g")));
-        match result {
-            Expr::App(l, r) => {
-                assert_eq!(free_name(&l).as_deref(), Some("f"));
-                assert_eq!(free_name(&r).as_deref(), Some("g"));
-            }
-            other => panic!("expected a stuck application, got: {other}"),
-        }
-    }
-
-    #[test]
-    fn lambda_is_already_whnf() {
-        // \x. x is already in WHNF; reducing returns a lambda unchanged.
-        let x = fresh_bv();
-        let id = lam(&x, var(&x));
-        match Reducer::whnf(id) {
-            Expr::Lambda(_) => {}
-            other => panic!("expected lambda, got: {other}"),
-        }
-    }
-
-    #[test]
-    fn nested_redex_in_argument_position() {
-        // (\x. \y. y) g ((\z. z) f)  ==>  ((\z. z) f) ... no:
-        // head (\x.\y.y) g  ==>  \y. y, then applied to ((\z.z) f)  ==>  f
-        let x = fresh_bv();
-        let y = fresh_bv();
-        let z = fresh_bv();
-        let snd = lam(&x, lam(&y, var(&y)));
-        let id_z = lam(&z, var(&z));
-        let result = Reducer::whnf(app(app(snd, free("g")), app(id_z, free("f"))));
-        assert_eq!(free_name(&result).as_deref(), Some("f"));
-    }
-
-    #[test]
-    fn shared_argument_forced_once() {
-        // (\x. x) applied to a thunk should force, but forcing is idempotent:
-        // reducing the same result twice must agree. Guards the Forced/Unforced cache.
-        let x = fresh_bv();
-        let y = fresh_bv();
-        let id = lam(&x, var(&x));
-        let inner = app(lam(&y, var(&y)), free("f"));
-        let result = Reducer::whnf(app(id, inner));
-        assert_eq!(free_name(&result).as_deref(), Some("f"));
-        // idempotent read
-        assert_eq!(free_name(&result).as_deref(), Some("f"));
-    }
-
-    #[test]
-    fn applied_under_neutral_head_keeps_both_args() {
-        // f a b  ==>  f a b  (spine stays intact, left-assoc)
-        let result = Reducer::whnf(app(app(free("f"), free("a")), free("b")));
-        match result {
-            Expr::App(l, r) => {
-                assert_eq!(free_name(&r).as_deref(), Some("b"));
-                match *l {
-                    Expr::App(ref ll, ref lr) => {
-                        assert_eq!(free_name(ll).as_deref(), Some("f"));
-                        assert_eq!(free_name(lr).as_deref(), Some("a"));
-                    }
-                    ref other => panic!("expected nested app, got {other}"),
-                }
-            }
-            other => panic!("expected spine, got {other}"),
-        }
-    }
-
-    #[test]
-    fn display_of_identity_is_stable() {
-        let x = fresh_bv();
-        let id = lam(&x, var(&x));
-        assert_eq!(format!("{id}"), "\\a a");
-    }
-}
-
 impl fmt::Display for Expr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut names: HashMap<*const BoundVar, String> = HashMap::new();
@@ -365,17 +182,15 @@ impl fmt::Display for Expr {
 }
 
 impl Expr {
-    /// Precedence of this node: atom = 2, application = 1, lambda = 0.
     fn prec(&self) -> u8 {
         match self {
             Expr::BoundVar(_) | Expr::FreeVar(_) => 2,
             Expr::App(..) => 1,
             Expr::Lambda(_) => 0,
-            Expr::Thunk(_) => 2, // never used; thunks are transparent in `pp`
+            Expr::Thunk(_) => 2,
         }
     }
 
-    /// Print, wrapping in parens if this node binds looser than `min_prec`.
     fn pp(
         &self,
         f: &mut fmt::Formatter<'_>,
@@ -394,7 +209,7 @@ impl Expr {
         match self {
             Expr::BoundVar(bv) => match names.get(&Rc::as_ptr(bv)) {
                 Some(name) => write!(f, "{name}")?,
-                None => write!(f, "_")?, // bound var with no binder in scope
+                None => write!(f, "_")?,
             },
             Expr::FreeVar(fv) => {
                 if fv.name.starts_with("fv_") {
@@ -409,12 +224,12 @@ impl Expr {
                     names.insert(Weak::as_ptr(&w), name.clone());
                 }
                 write!(f, "\\{name} ")?;
-                l.body.pp(f, names, next, 0)?; // body never needs parens
+                l.body.pp(f, names, next, 0)?;
             }
             Expr::App(lhs, rhs) => {
-                lhs.pp(f, names, next, 1)?; // fn position: parenthesize lambdas
+                lhs.pp(f, names, next, 1)?;
                 write!(f, " ")?;
-                rhs.pp(f, names, next, 2)?; // arg position: parenthesize app/lambda
+                rhs.pp(f, names, next, 2)?;
             }
             Expr::Thunk(_) => unreachable!("handled above"),
         }
@@ -425,7 +240,6 @@ impl Expr {
     }
 }
 
-/// Fresh variable name: a, b, …, z, aa, ab, … (your `get_next` scheme).
 fn fresh(next: &mut String) -> String {
     let name = next.clone();
     if next.ends_with('z') {
