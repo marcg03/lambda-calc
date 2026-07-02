@@ -184,3 +184,299 @@ impl Parser {
         }
     }
 }
+
+#[cfg(test)]
+mod test {
+    use crate::expr::Expr;
+    use crate::parser::Parser;
+    use std::rc::Rc;
+
+    fn parse(s: &str) -> Expr {
+        Parser::parse(s).unwrap_or_else(|e| panic!("failed to parse {s:?}: {e}"))
+    }
+
+    // ---------- variables ----------
+
+    #[test]
+    fn single_free_var() {
+        let e = parse("x");
+        match e {
+            Expr::FreeVar(fv) => assert_eq!(fv.name, "x"),
+            other => panic!("expected FreeVar, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multichar_free_var_name() {
+        let e = parse("foo");
+        match e {
+            Expr::FreeVar(fv) => assert_eq!(fv.name, "foo"),
+            other => panic!("expected FreeVar, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn free_var_name_may_contain_underscore_after_first_char() {
+        let e = parse("x_y");
+        match e {
+            Expr::FreeVar(fv) => assert_eq!(fv.name, "x_y"),
+            other => panic!("expected FreeVar, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn same_free_var_name_shares_allocation() {
+        // The parser interns free variables per parse.
+        let e = parse("x x");
+        match e {
+            Expr::App(l, r) => match (*l, *r) {
+                (Expr::FreeVar(a), Expr::FreeVar(b)) => {
+                    assert!(
+                        Rc::ptr_eq(&a, &b),
+                        "both `x` should be the same Rc<FreeVar>"
+                    )
+                }
+                other => panic!("expected FreeVar FreeVar, got {other:?}"),
+            },
+            other => panic!("expected App, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn different_free_var_names_get_different_allocations() {
+        let e = parse("x y");
+        match e {
+            Expr::App(l, r) => match (*l, *r) {
+                (Expr::FreeVar(a), Expr::FreeVar(b)) => {
+                    assert!(!Rc::ptr_eq(&a, &b));
+                    assert_eq!(a.name, "x");
+                    assert_eq!(b.name, "y");
+                }
+                other => panic!("expected FreeVar FreeVar, got {other:?}"),
+            },
+            other => panic!("expected App, got {other:?}"),
+        }
+    }
+
+    // ---------- lambdas & binder identity ----------
+
+    #[test]
+    fn identity_lambda_links_body_var_to_binder() {
+        let e = parse("\\x x");
+        let Expr::Lambda(l) = e else {
+            panic!("expected Lambda, got {e:?}")
+        };
+        let Expr::BoundVar(ref body_bv) = l.body else {
+            panic!("expected BoundVar body, got {:?}", l.body)
+        };
+        let assoc = l
+            .associated_bound_var()
+            .expect("lambda with a referenced param should have a bound var")
+            .upgrade()
+            .expect("bound var should still be alive");
+        assert!(Rc::ptr_eq(body_bv, &assoc));
+    }
+
+    #[test]
+    fn unused_param_has_no_associated_bound_var() {
+        let e = parse("\\x y");
+        let Expr::Lambda(l) = e else {
+            panic!("expected Lambda, got {e:?}")
+        };
+        assert!(
+            l.associated_bound_var().is_none(),
+            "a never-referenced parameter should not allocate a bound var"
+        );
+        match &l.body {
+            Expr::FreeVar(fv) => assert_eq!(fv.name, "y"),
+            other => panic!("expected FreeVar body, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multiple_occurrences_of_bound_var_share_pointer() {
+        let e = parse("\\x x x");
+        let Expr::Lambda(l) = e else {
+            panic!("expected Lambda, got {e:?}")
+        };
+        let Expr::App(ref lhs, ref rhs) = l.body else {
+            panic!("expected App body, got {:?}", l.body)
+        };
+        match (lhs.as_ref(), rhs.as_ref()) {
+            (Expr::BoundVar(a), Expr::BoundVar(b)) => {
+                assert!(
+                    Rc::ptr_eq(a, b),
+                    "both occurrences must be the same BoundVar"
+                )
+            }
+            other => panic!("expected BoundVar BoundVar, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lambda_body_extends_maximally_right() {
+        // `\x x y` is `\x (x y)`, not `(\x x) y`.
+        let e = parse("\\x x y");
+        let Expr::Lambda(l) = e else {
+            panic!("expected Lambda, got {e:?}")
+        };
+        assert!(matches!(l.body, Expr::App(..)));
+    }
+
+    // ---------- application structure ----------
+
+    #[test]
+    fn application_is_left_associative() {
+        // `a b c` is `(a b) c`.
+        let e = parse("a b c");
+        let Expr::App(l, r) = e else {
+            panic!("expected App, got {e:?}")
+        };
+        assert!(matches!(*l, Expr::App(..)), "left side should be `a b`");
+        match *r {
+            Expr::FreeVar(fv) => assert_eq!(fv.name, "c"),
+            other => panic!("expected FreeVar c, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parentheses_override_associativity() {
+        // `a (b c)` groups to the right.
+        let e = parse("a (b c)");
+        let Expr::App(l, r) = e else {
+            panic!("expected App, got {e:?}")
+        };
+        match *l {
+            Expr::FreeVar(ref fv) => assert_eq!(fv.name, "a"),
+            ref other => panic!("expected FreeVar a, got {other:?}"),
+        }
+        assert!(matches!(*r, Expr::App(..)), "right side should be `b c`");
+    }
+
+    #[test]
+    fn redundant_parens_are_transparent() {
+        let e = parse("((x))");
+        assert!(matches!(e, Expr::FreeVar(_)));
+    }
+
+    // ---------- scoping & shadowing ----------
+
+    #[test]
+    fn shadowing_binds_to_innermost_lambda() {
+        // In `\x \x x`, the body var belongs to the *inner* binder.
+        let e = parse("\\x \\x x");
+        let Expr::Lambda(outer) = e else {
+            panic!("expected Lambda, got {e:?}")
+        };
+        assert!(
+            outer.associated_bound_var().is_none(),
+            "outer x is fully shadowed, so it is never referenced"
+        );
+        let Expr::Lambda(ref inner) = outer.body else {
+            panic!("expected inner Lambda, got {:?}", outer.body)
+        };
+        let inner_bv = inner
+            .associated_bound_var()
+            .expect("inner binder is referenced")
+            .upgrade()
+            .unwrap();
+        let Expr::BoundVar(ref body_bv) = inner.body else {
+            panic!("expected BoundVar body")
+        };
+        assert!(Rc::ptr_eq(body_bv, &inner_bv));
+    }
+
+    #[test]
+    fn outer_binding_is_restored_after_shadowed_scope_ends() {
+        // `\x x (\x x) x`: first and last x belong to the outer binder,
+        // the middle x to the inner one.
+        let e = parse("\\x x (\\x x) x");
+        let Expr::Lambda(outer) = e else {
+            panic!("expected Lambda, got {e:?}")
+        };
+        // body is App(App(x, \x x), x)
+        let Expr::App(ref l, ref last) = outer.body else {
+            panic!("expected App body")
+        };
+        let Expr::App(ref first, ref inner_lam) = **l else {
+            panic!("expected nested App")
+        };
+        let (Expr::BoundVar(first_bv), Expr::BoundVar(last_bv)) = (first.as_ref(), last.as_ref())
+        else {
+            panic!("expected outer occurrences to be BoundVars")
+        };
+        assert!(
+            Rc::ptr_eq(first_bv, last_bv),
+            "occurrences before and after the inner lambda must share the outer binder"
+        );
+
+        let Expr::Lambda(inner) = inner_lam.as_ref() else {
+            panic!("expected inner Lambda")
+        };
+        let Expr::BoundVar(ref mid_bv) = inner.body else {
+            panic!("expected inner BoundVar")
+        };
+        assert!(
+            !Rc::ptr_eq(first_bv, mid_bv),
+            "the shadowed occurrence must be a different BoundVar"
+        );
+    }
+
+    #[test]
+    fn param_goes_out_of_scope_after_lambda() {
+        // In `(\x x) x`, the trailing x is free.
+        let e = parse("(\\x x) x");
+        let Expr::App(_, r) = e else {
+            panic!("expected App, got {e:?}")
+        };
+        match *r {
+            Expr::FreeVar(fv) => assert_eq!(fv.name, "x"),
+            other => panic!("trailing x should be free, got {other:?}"),
+        }
+    }
+
+    // ---------- whitespace ----------
+
+    #[test]
+    fn whitespace_is_insignificant() {
+        for s in ["  x  ", "\\x   x", "\\ x x", " ( \\x  x )  y ", "a\n b\tc"] {
+            assert!(Parser::parse(s).is_ok(), "should parse {s:?}");
+        }
+    }
+
+    // ---------- errors ----------
+
+    #[test]
+    fn error_cases() {
+        let bad = [
+            "",         // empty input
+            "   ",      // only whitespace
+            "(",        // unclosed paren, no expr
+            "(a",       // unclosed paren
+            "()",       // empty parens
+            "a)",       // stray closing paren after a full expr
+            ")a",       // leading closing paren
+            "\\",       // lambda without param
+            "\\x",      // lambda without body
+            "\\ \\x x", // param must be a name, not another lambda
+            "a $ b",    // illegal symbol
+            "a1",       // digits are not part of names
+            "_x",       // a term can't start with underscore
+            "\\x_y x",  // params are ascii-alphabetic only, so `_y` is left over
+        ];
+        for s in bad {
+            assert!(
+                Parser::parse(s).is_err(),
+                "expected parse error for {s:?}, got {:?}",
+                Parser::parse(s)
+            );
+        }
+    }
+
+    #[test]
+    fn error_messages_are_stable_for_key_cases() {
+        assert_eq!(Parser::parse("").unwrap_err(), "Expression not found");
+        assert_eq!(Parser::parse("(a").unwrap_err(), "Expected )");
+        assert_eq!(Parser::parse("\\").unwrap_err(), "Expected variable");
+    }
+}
